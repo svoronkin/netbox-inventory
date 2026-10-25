@@ -1,11 +1,11 @@
-﻿<#
+<#
 .SYNOPSIS
-    netbox_inventory.ps1 — инвентаризация Windows-хоста в NetBox.
+    netbox_inventory.ps1 - inventory of a Windows host into NetBox.
 
 .DESCRIPTION
-    Собирает данные о железе, ОС и сети через CIM/WMI и создаёт или обновляет устройство в NetBox
-    через REST API. Аналог netbox_inventory.sh для Linux: та же логика и тот же формат -CollectOnly.
-    Работает в Windows PowerShell 5.1 и PowerShell 7+, внешних зависимостей нет.
+    Collects hardware, OS and network data via CIM/WMI and creates or updates the device in NetBox
+    through the REST API. Counterpart of netbox_inventory.sh for Linux: same logic and the same -CollectOnly format.
+    Works in Windows PowerShell 5.1 and PowerShell 7+, no external dependencies.
 
 .EXAMPLE
     .\netbox_inventory.ps1 -CollectOnly
@@ -36,9 +36,9 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-$ScriptVersion = '2.1.0'
+$ScriptVersion = '2.2.0'
 
-# ---------- вывод: всё служебное — в stderr, stdout только для JSON (-CollectOnly) ----------
+# ---------- output: all messages go to stderr, stdout is only for JSON (-CollectOnly) ----------
 function Say([string]$m, $color = $null) {
     if ($null -ne $color) { $old = [Console]::ForegroundColor; [Console]::ForegroundColor = $color }
     [Console]::Error.WriteLine($m)
@@ -50,7 +50,7 @@ function Warn([string]$m)   { Say "WARN: $m" 'Yellow' }
 function Change([string]$m) { Say ("{0} {1}" -f $(if ($DryRun) { '[dry-run]' } else { '*' }), $m) 'Cyan' }
 function Die([string]$m)    { Say "ERROR: $m" 'Red'; exit 1 }
 
-# ---------- утилиты ----------
+# ---------- helpers ----------
 $JunkValues = @('', 'unknown', 'none', 'n/a', 'na', 'not specified', 'not available', 'default string',
     'system manufacturer', 'system product name', 'system serial number', 'to be filled by o.e.m.',
     'to be filled by o.e.m', 'o.e.m.', 'oem', 'base board serial number', 'chassis serial number',
@@ -69,12 +69,24 @@ function Slugify([string]$s) {
 }
 function Enc([string]$s) { [uri]::EscapeDataString($s) }
 
-# Нормализация производителей: одно имя на вендора, чтобы не плодить дубли
+# Vendor normalization: one name per vendor, so that duplicates are not created
 function Normalize-Vendor([string]$v) {
     $v = Clean $v
     if (-not $v) { return '' }
     switch -Regex ($v.ToLower()) {
         '^(intel|genuineintel)'                { return 'Intel' }
+        '^nvidia'                              { return 'NVIDIA' }
+        '^sapphire'                            { return 'Sapphire' }
+        '^zotac'                               { return 'Zotac' }
+        '^palit'                               { return 'Palit' }
+        '^evga'                                { return 'EVGA' }
+        '^pny'                                 { return 'PNY' }
+        '^xfx'                                 { return 'XFX' }
+        '^(powercolor|tul corp)'               { return 'PowerColor' }
+        '^gainward'                            { return 'Gainward' }
+        '^(galax|kfa2)'                        { return 'Galax' }
+        '^colorful'                            { return 'Colorful' }
+        '^inno3d'                              { return 'Inno3D' }
         '^(amd|advanced micro devices|authenticamd)' { return 'AMD' }
         '^samsung'                             { return 'Samsung' }
         '^kingston'                            { return 'Kingston' }
@@ -106,7 +118,7 @@ function Normalize-Vendor([string]$v) {
     return $v
 }
 
-# Производитель диска по модели
+# Disk vendor from the model
 function Disk-Vendor([string]$m) {
     switch -Regex ($m.ToUpper()) {
         '^(SAMSUNG|MZ)'                   { return 'Samsung' }
@@ -126,7 +138,7 @@ function Disk-Vendor([string]$m) {
     return Normalize-Vendor ($m -split ' ')[0]
 }
 
-# Производитель RAM: SMBIOS часто отдаёт JEDEC-код вместо имени — тогда по партномеру
+# RAM vendor: SMBIOS often reports a JEDEC code instead of a name - then use the part number
 function Ram-Vendor([string]$v, [string]$part) {
     switch -Regex ($part.ToUpper()) {
         '^(CT[0-9]|BL[0-9])'                       { return 'Crucial' }
@@ -142,9 +154,52 @@ function Ram-Vendor([string]$v, [string]$part) {
     return $n
 }
 
+# Integrated CPU graphics, BMC, remote and virtual adapters are not graphics cards
+$IGpuRegex = 'Iris|(UHD|HD|Xe) Graphics|Arc\(TM\) Graphics|Radeon\(TM\) Graphics$|Radeon Graphics$|Radeon Vega|ASPEED|Matrox|Microsoft Basic|Remote Display|Virtual|Parsec|Citrix|DisplayLink|Hyper-V|Meta Virtual|Splashtop'
+# Board vendor code (SUBSYS_xxxxVVVV) -> graphics card manufacturer
+$PciSubVendors = @{
+    '1043' = 'ASUS'; '1458' = 'Gigabyte'; '1462' = 'MSI'; '19DA' = 'Zotac'; '196E' = 'PNY'; '10B0' = 'Gainward'
+    '1569' = 'Palit'; '3842' = 'EVGA'; '1682' = 'XFX'; '174B' = 'Sapphire'; '1DA2' = 'Sapphire'; '148C' = 'PowerColor'
+    '1849' = 'ASRock'; '7377' = 'Colorful'; '1B4C' = 'Galax'; '10DE' = 'NVIDIA'; '1002' = 'AMD'; '8086' = 'Intel'
+    '1028' = 'Dell'; '103C' = 'HPE'; '17AA' = 'Lenovo'; '1025' = 'Acer'
+}
+
 # ======================================================================
-#  Сбор данных о хосте
+#  Host data collection
 # ======================================================================
+function Get-Gpus {
+    $classKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+    $regs = @(Get-ChildItem $classKey -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^\d{4}$' } |
+        ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } | Where-Object { $_ -and $_.PSObject.Properties['MatchingDeviceId'] })
+    $gens = @{ 1 = '1.0'; 2 = '2.0'; 3 = '3.0'; 4 = '4.0'; 5 = '5.0'; 6 = '6.0' }
+    $out = @()
+    foreach ($v in Get-CimInstance Win32_VideoController) {
+        $name = ([string]$v.Name).Trim()
+        if (-not $v.PNPDeviceID -or $v.PNPDeviceID -notlike 'PCI\*' -or $name -match $IGpuRegex) { continue }
+        $chipVendor = Normalize-Vendor $v.AdapterCompatibility
+        $model = ($name -replace '^(NVIDIA|AMD|Intel\(R\)|Intel)\s+', '').Trim()
+        $card = $chipVendor
+        if ($v.PNPDeviceID -match 'SUBSYS_[0-9A-F]{4}([0-9A-F]{4})' -and $PciSubVendors.ContainsKey($Matches[1].ToUpper())) { $card = $PciSubVendors[$Matches[1].ToUpper()] }
+        # Memory size: WMI AdapterRAM is 32-bit (4 GB max), so qwMemorySize from the driver is used
+        $mem = $null
+        $reg = $regs | Where-Object { $v.PNPDeviceID.ToLower().StartsWith(([string]$_.MatchingDeviceId).ToLower()) } | Select-Object -First 1
+        if ($reg -and $reg.PSObject.Properties['HardwareInformation.qwMemorySize']) { $mem = [int][math]::Round([double]$reg.'HardwareInformation.qwMemorySize' / 1GB) }
+        elseif ($v.AdapterRAM -and [double]$v.AdapterRAM -lt 4GB) { $mem = [int][math]::Round([double]$v.AdapterRAM / 1GB) }
+        if ($mem -eq 0) { $mem = $null }
+        $gen = ''; $width = $null; $loc = ''
+        try {
+            $spd = (Get-PnpDeviceProperty -InstanceId $v.PNPDeviceID -KeyName DEVPKEY_PciDevice_MaxLinkSpeed -ErrorAction Stop).Data
+            if ($gens.ContainsKey([int]$spd)) { $gen = $gens[[int]$spd] }
+            $width = [int](Get-PnpDeviceProperty -InstanceId $v.PNPDeviceID -KeyName DEVPKEY_PciDevice_MaxLinkWidth -ErrorAction Stop).Data
+            $loc = [string](Get-PnpDeviceProperty -InstanceId $v.PNPDeviceID -KeyName DEVPKEY_Device_LocationInfo -ErrorAction Stop).Data
+        } catch { }
+        if ($width -eq 0) { $width = $null }
+        $out += [ordered]@{ pci = $loc; vendor = $chipVendor; card_vendor = $card; name = $model; chip = $name
+                            memory_gb = $mem; pcie_gen = $gen; pcie_width = $width; serial = '' }
+    }
+    return ,$out
+}
+
 function Get-Facts {
     $cs   = Get-CimInstance Win32_ComputerSystem
     $bios = Get-CimInstance Win32_BIOS
@@ -157,7 +212,7 @@ function Get-Facts {
     if ($cs.PartOfDomain -and $cs.Domain) { $fqdn = ("{0}.{1}" -f $cs.DNSHostName, $cs.Domain).ToLower() }
     else { try { $h = [Net.Dns]::GetHostEntry('').HostName; if ($h -like '*.*') { $fqdn = $h.ToLower() } } catch { } }
 
-    # ОС -> платформа
+    # OS -> platform
     $isServer = $os.ProductType -ne 1
     $platformName = if ($isServer) { 'Windows Server' } else { 'Windows' }
     $displayVer = ''
@@ -167,8 +222,8 @@ function Get-Facts {
     $cpus = @(Get-CimInstance Win32_Processor)
     $cpu0 = $cpus[0]
     $cpuModel = ([string]$cpu0.Name).Trim()
-    # Частота: из названия модели, иначе из реестра (~MHz), иначе MaxClockSpeed. WMI на некоторых сборках
-    # отдаёт в MaxClockSpeed мусор, поэтому значения вне 0.1–10 ГГц отбрасываем.
+    # Frequency: from the model name, otherwise from the registry (~MHz), otherwise MaxClockSpeed. On some builds
+    # WMI reports garbage in MaxClockSpeed, so values outside 0.1-10 GHz are discarded.
     $cpuSpeed = $null
     if ($cpuModel -match '@\s*([0-9]+\.[0-9]+)\s*GHz') { $cpuSpeed = [double]$Matches[1] }
     else {
@@ -200,7 +255,7 @@ function Get-Facts {
         }
     } | Where-Object { $_.size_gb -gt 0 })
 
-    # Диски
+    # Disks
     $disks = @()
     $pds = $null
     try { $pds = @(Get-PhysicalDisk -ErrorAction Stop) } catch { }
@@ -234,7 +289,7 @@ function Get-Facts {
         }
     }
 
-    # Сеть
+    # Network
     $defIdx = $null
     $def = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
         Sort-Object { $_.RouteMetric + (Get-NetIPInterface -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).InterfaceMetric } |
@@ -243,8 +298,8 @@ function Get-Facts {
     $defName = ''
     $ifaces = @()
     $adapters = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { "$($_.Status)" -ne 'Not Present' })
-    # Несколько адаптеров на одном PnP-устройстве (Wi-Fi Direct, HBS/MLO у Wi-Fi 7) — это одна карта:
-    # оставляем адаптер с заводским MAC (бит locally administered сброшен)
+    # Several adapters on one PnP device (Wi-Fi Direct, HBS/MLO on Wi-Fi 7) are one card:
+    # keep the adapter with the factory MAC (locally administered bit cleared)
     $isLocalMac = { param($m) $m -and ([Convert]::ToInt32(($m -replace '[-:]', '').Substring(0, 2), 16) -band 2) }
     $dupSkip = @{}
     foreach ($grp in ($adapters | Where-Object { $_.PnPDeviceID } | Group-Object PnPDeviceID | Where-Object { $_.Count -gt 1 })) {
@@ -295,17 +350,18 @@ function Get-Facts {
         }
         memory = [ordered]@{ total_gb = [int][math]::Round([double]$cs.TotalPhysicalMemory / 1GB); ecc = $ecc; modules = $modules }
         disks = $disks
+        gpus = (Get-Gpus)
         default_iface = $defName
         interfaces = $ifaces
     }
 }
 
-# Какие интерфейсы не нужны в NetBox
+# Interfaces that are not needed in NetBox
 function Skip-Interface($i) {
     $d = "$($i.description)"
     if ($d -match 'Loopback|WAN Miniport|Teredo|ISATAP|6to4|IP-HTTPS|Kernel Debug|Bluetooth|Microsoft Wi-Fi Direct|VirtualBox Host-Only|VMware Virtual Ethernet|Npcap') { return $true }
-    if ($i.name -match '^vEthernet \((WSL|Default Switch)') { return $true }   # внутренние сети Hyper-V/WSL
-    # Виртуальные «двойники» Wi-Fi (Wi-Fi Direct, режимы HBS/MLO) и служебные адаптеры без адресов
+    if ($i.name -match '^vEthernet \((WSL|Default Switch)') { return $true }   # internal Hyper-V/WSL networks
+    # Virtual Wi-Fi "twins" (Wi-Fi Direct, HBS/MLO modes) and service adapters without addresses
     if ($i.wireless -and -not $i.hardware) { return $true }
     if (-not $i.hardware -and @($i.addresses).Count -eq 0) { return $true }
     if ($SkipInterfaceRegex -and $i.name -match $SkipInterfaceRegex) { return $true }
@@ -322,22 +378,22 @@ $script:TagRef = @()
 function Setup-Api {
     $token = $env:NETBOX_TOKEN
     if (-not $token -and $TokenFile) {
-        if (-not (Test-Path $TokenFile)) { Die "не удаётся прочитать $TokenFile" }
+        if (-not (Test-Path $TokenFile)) { Die "cannot read $TokenFile" }
         $token = Get-Content -Raw $TokenFile
     }
-    if (-not $token) { Die 'нет API-токена: задайте NETBOX_TOKEN или -TokenFile' }
-    # Допускаем, что скопировали заголовок целиком: "Bearer nbt_..." / "Token ..."
+    if (-not $token) { Die 'no API token: set NETBOX_TOKEN or -TokenFile' }
+    # Accept a whole header copied into the file: "Bearer nbt_..." / "Token ..."
     $token = ($token -replace '^\s*(Bearer|Token)\s+', '') -replace '\s', ''
     $scheme = if ($token -like 'nbt_*') { 'Bearer' } else { 'Token' }
     $script:Headers = @{ Authorization = "$scheme $token"; Accept = 'application/json' }
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
     if ($Insecure) {
-        Warn 'проверка TLS отключена (-Insecure)'
+        Warn 'TLS verification disabled (-Insecure)'
         if ($PSVersionTable.PSVersion.Major -lt 6) { [Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } }
     }
 }
 
-# Nb METHOD PATH [BODY] -> объект ответа; при ошибке — исключение с текстом ответа NetBox
+# Nb METHOD PATH [BODY] -> response object; on error throws with the NetBox response text
 function Nb([string]$Method, [string]$Path, $Body = $null) {
     if ($Method -ne 'GET' -and $DryRun) { return [pscustomobject]@{ id = 0 } }
     $uri = "{0}/api/{1}" -f $Url.TrimEnd('/'), $Path.TrimStart('/')
@@ -351,19 +407,19 @@ function Nb([string]$Method, [string]$Path, $Body = $null) {
     try { return Invoke-RestMethod @p }
     catch {
         $msg = if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
-        if ($msg -match 'token|credentials') { Die "токен не принят ($msg). Проверьте токен и его права." }
+        if ($msg -match 'token|credentials') { Die "token rejected ($msg). Check the token and its permissions." }
         throw "$Method /api/$Path : $msg"
     }
 }
 
 function Nb-Find([string]$Path, [string]$Query) {
     $r = Nb GET "$($Path)?$Query&limit=2"
-    if ($r.count -gt 1) { Warn "найдено $($r.count) объектов $($Path)?$Query, беру первый" }
+    if ($r.count -gt 1) { Warn "found $($r.count) objects $($Path)?$Query, using the first one" }
     if ($r.count -ge 1) { return $r.results[0] }
     return $null
 }
 
-# Найти по slug/name, иначе создать. Возвращает id.
+# Find by slug/name, otherwise create. Returns the id.
 function Nb-EnsureNamed([string]$Path, [string]$NameValue, [hashtable]$Extra = @{}) {
     $slug = Slugify $NameValue
     $o = $null
@@ -371,11 +427,11 @@ function Nb-EnsureNamed([string]$Path, [string]$NameValue, [hashtable]$Extra = @
     if (-not $o) { $o = Nb-Find $Path "name__ie=$(Enc $NameValue)" }
     if ($o) { return [int]$o.id }
     $body = @{ name = $NameValue; slug = $(if ($slug) { $slug } else { 'x-' + [guid]::NewGuid().ToString('N').Substring(0, 8) }); tags = $script:TagRef } + $Extra
-    Change "создать $($Path.TrimEnd('/')) '$NameValue'"
+    Change "create $($Path.TrimEnd('/')) '$NameValue'"
     return [int](Nb POST $Path $body).id
 }
 
-# Только найти (сайт/арендатор/стойка/локация никогда не создаются)
+# Lookup only (site/tenant/rack/location are never created)
 function Nb-LookupNamed([string]$Path, [string]$NameValue, [string]$ExtraQ = '') {
     $q = if ($ExtraQ) { "&$ExtraQ" } else { '' }
     $o = Nb-Find $Path "name__ie=$(Enc $NameValue)$q"
@@ -385,17 +441,17 @@ function Nb-LookupNamed([string]$Path, [string]$NameValue, [string]$ExtraQ = '')
 }
 
 function Check-NetBox {
-    try { $st = Nb GET 'status/' } catch { Die "NetBox недоступен: $Url ($_)" }
+    try { $st = Nb GET 'status/' } catch { Die "NetBox is unreachable: $Url ($_)" }
     $script:NbVersion = ("$($st.'netbox-version')" -split '-')[0]
     $null = Nb GET 'dcim/sites/?limit=1'
     Ok "NetBox $($script:NbVersion) ($Url)"
     $script:TagRef = @(@{ slug = (Slugify $Tag) })
-    if (-not $DryRun) { $null = Nb-EnsureNamed 'extras/tags/' $Tag @{ color = '9e9e9e'; description = 'Создано netbox_inventory.ps1' } }
+    if (-not $DryRun) { $null = Nb-EnsureNamed 'extras/tags/' $Tag @{ color = '9e9e9e'; description = 'Created by netbox_inventory.ps1' } }
 }
 function Version-Ge([string]$a, [string]$b) { try { return [version]$a -ge [version]$b } catch { return $false } }
 
 # ======================================================================
-#  Устройство
+#  Device
 # ======================================================================
 $script:DeviceId = 0
 $script:Device = $null
@@ -405,33 +461,33 @@ function Ensure-DeviceType($f) {
     if (-not $model) { $model = $f.system.board_name; $vendor = $f.system.board_vendor }
     if (-not $model) { $model = 'Generic workstation' }
     $vendor = Normalize-Vendor $vendor; if (-not $vendor) { $vendor = 'Generic' }
-    # Сначала ищем модель у любого производителя: не плодим дубль, если тип уже заведён вручную
+    # First look for the model under any manufacturer: no duplicate if the type was created manually
     $o = Nb-Find 'dcim/device-types/' "model__ie=$(Enc $model)"
     if ($o) { return [int]$o.id }
     $mid = Nb-EnsureNamed 'dcim/manufacturers/' $vendor
-    Change "создать тип устройства '$vendor $model'"
+    Change "create device type '$vendor $model'"
     return [int](Nb POST 'dcim/device-types/' @{ manufacturer = $mid; model = $model; slug = (Slugify "$vendor-$model"); tags = $script:TagRef }).id
 }
 
-# Платформа может быть ограничена производителем — тогда NetBox не даст её назначить
+# A platform can be restricted to a manufacturer - then NetBox will not allow assigning it
 function Platform-ForType([int]$PlatformId, [int]$TypeId) {
     if ($PlatformId -le 0 -or $TypeId -le 0) { return $PlatformId }
     $pl = Nb GET "dcim/platforms/$PlatformId/"
     if ($pl.manufacturer) {
         $dt = Nb GET "dcim/device-types/$TypeId/"
         if ($pl.manufacturer.id -ne $dt.manufacturer.id) {
-            Warn "платформа '$($pl.name)' ограничена производителем '$($pl.manufacturer.name)' — не назначаю. Уберите manufacturer у платформы в NetBox, если это ОС."
+            Warn "platform '$($pl.name)' is restricted to manufacturer '$($pl.manufacturer.name)' - not assigning it. Clear the platform manufacturer in NetBox if it is an OS."
             return 0
         }
     }
     return $PlatformId
 }
 
-# Hostname может не совпадать с именем в NetBox: ищем по серийнику, затем по IP-адресам хоста
+# The hostname may differ from the NetBox name: look up by serial number, then by host IP addresses
 function Find-DeviceFallback($f, [string]$Serial) {
     if ($Serial) {
         $r = Nb GET "dcim/devices/?serial=$(Enc $Serial)&limit=2"
-        if ($r.count -eq 1) { Log "  найдено по серийному номеру $Serial"; return $r.results[0] }
+        if ($r.count -eq 1) { Log "  found by serial number $Serial"; return $r.results[0] }
     }
     $ids = @()
     foreach ($i in $f.interfaces) { foreach ($a in $i.addresses) {
@@ -440,7 +496,7 @@ function Find-DeviceFallback($f, [string]$Serial) {
         if ($ip -and $ip.assigned_object -and $ip.assigned_object.PSObject.Properties['device']) { $ids += [int]$ip.assigned_object.device.id }
     } }
     $ids = @($ids | Sort-Object -Unique)
-    if ($ids.Count -eq 1) { Log '  найдено по IP-адресам хоста'; return (Nb GET "dcim/devices/$($ids[0])/") }
+    if ($ids.Count -eq 1) { Log '  found by host IP addresses'; return (Nb GET "dcim/devices/$($ids[0])/") }
     return $null
 }
 
@@ -451,13 +507,13 @@ function Ensure-Device($f) {
     $platName = if ($Platform) { $Platform } else { $f.os.platform }
     $platformId = if ($platName) { Nb-EnsureNamed 'dcim/platforms/' $platName } else { 0 }
     $tenantId = 0
-    if ($Tenant) { $tenantId = Nb-LookupNamed 'tenancy/tenants/' $Tenant; if (-not $tenantId) { Die "арендатор '$Tenant' не найден" } }
+    if ($Tenant) { $tenantId = Nb-LookupNamed 'tenancy/tenants/' $Tenant; if (-not $tenantId) { Die "tenant '$Tenant' not found" } }
 
     $script:Device = Nb-Find 'dcim/devices/' "name=$(Enc $devName)"
     if (-not $script:Device -and -not $explicit) {
         $script:Device = Find-DeviceFallback $f $serial
         if ($script:Device) {
-            Warn "hostname '$devName' не совпадает с именем в NetBox '$($script:Device.name)' — использую его (имя в NetBox не меняю; чтобы не искать, укажите -Name)"
+            Warn "hostname '$devName' differs from the NetBox name '$($script:Device.name)' - using it (the NetBox name is not changed; use -Name to skip the lookup)"
             $devName = $script:Device.name
         }
     }
@@ -465,7 +521,7 @@ function Ensure-Device($f) {
 
     if ($script:Device) {
         $script:DeviceId = [int]$script:Device.id
-        Ok "устройство '$devName' найдено (id $($script:DeviceId))"
+        Ok "device '$devName' found (id $($script:DeviceId))"
         $platformId = Platform-ForType $platformId ([int]$script:Device.device_type.id)
         $patch = @{}
         if ($serial -and -not $script:Device.serial) { $patch.serial = $serial }
@@ -474,16 +530,16 @@ function Ensure-Device($f) {
         $curTn = if ($script:Device.tenant) { [int]$script:Device.tenant.id } else { 0 }
         if ($tenantId -gt 0 -and $curTn -ne $tenantId) { $patch.tenant = $tenantId }
         if ($patch.Count) {
-            Change "обновить устройство ${devName}: $(ConvertTo-Json -InputObject $patch -Compress)"
+            Change "update device ${devName}: $(ConvertTo-Json -InputObject $patch -Compress)"
             $null = Nb PATCH "dcim/devices/$($script:DeviceId)/" $patch
         }
-        if ($Rack -or $Location) { Warn '-Rack/-Location применяются только при создании; размещение существующего устройства не меняю' }
+        if ($Rack -or $Location) { Warn '-Rack/-Location apply only on creation; placement of an existing device is not changed' }
         return
     }
 
-    if (-not $Site) { Die "устройства '$devName' нет в NetBox; для создания укажите -Site" }
+    if (-not $Site) { Die "device '$devName' is not in NetBox; specify -Site to create it" }
     $siteId = Nb-LookupNamed 'dcim/sites/' $Site
-    if (-not $siteId) { Die "сайт '$Site' не найден" }
+    if (-not $siteId) { Die "site '$Site' not found" }
     $roleId = Nb-EnsureNamed 'dcim/device-roles/' $Role @{ color = '9e9e9e' }
     $typeId = Ensure-DeviceType $f
     $platformId = Platform-ForType $platformId $typeId
@@ -493,28 +549,29 @@ function Ensure-Device($f) {
     if ($tenantId -gt 0) { $body.tenant = $tenantId }
     if ($Location) {
         $l = Nb-LookupNamed 'dcim/locations/' $Location "site_id=$siteId"
-        if (-not $l) { Die "локация '$Location' не найдена на сайте '$Site'" }
+        if (-not $l) { Die "location '$Location' not found at site '$Site'" }
         $body.location = $l
     }
     if ($Rack) {
         $r = Nb-LookupNamed 'dcim/racks/' $Rack "site_id=$siteId"
-        if (-not $r) { Die "стойка '$Rack' не найдена на сайте '$Site'" }
+        if (-not $r) { Die "rack '$Rack' not found at site '$Site'" }
         $body.rack = $r
     }
-    Change "создать устройство '$devName'"
+    Change "create device '$devName'"
     $script:DeviceId = [int](Nb POST 'dcim/devices/' $body).id
 }
 
 # ======================================================================
-#  Модули: CPU, RAM, диски
+#  Modules: CPU, RAM, disks, GPUs
 # ======================================================================
 $script:Profiles = @{}
+$script:ProfileSchemas = @{}
 $script:Modules = @()
 $script:Bays = @()
 
 function Load-Profiles {
-    if (-not (Version-Ge $script:NbVersion '4.3')) { Warn "NetBox $($script:NbVersion) < 4.3: профили модулей недоступны"; return }
-    foreach ($p in (Nb GET 'dcim/module-type-profiles/?limit=100').results) { $script:Profiles[$p.name] = [int]$p.id }
+    if (-not (Version-Ge $script:NbVersion '4.3')) { Warn "NetBox $($script:NbVersion) < 4.3: module type profiles are unavailable"; return }
+    foreach ($p in (Nb GET 'dcim/module-type-profiles/?limit=100').results) { $script:Profiles[$p.name] = [int]$p.id; $script:ProfileSchemas[$p.name] = $p.schema }
 }
 function Load-DeviceModules {
     if ($script:DeviceId -le 0) { return }
@@ -531,16 +588,34 @@ function Ensure-ModuleType([string]$Vendor, [string]$Model, [string]$ProfileName
     }
     $body = @{ manufacturer = $mid; model = $Model; tags = $script:TagRef }
     if ($script:Profiles.ContainsKey($ProfileName)) {
-        $a = @{}; foreach ($k in $Attrs.Keys) { if ($null -ne $Attrs[$k]) { $a[$k] = $Attrs[$k] } }
-        $body.profile = $script:Profiles[$ProfileName]; $body.attributes = $a
+        # Check attributes against the profile schema: unknown keys and values outside the enum are dropped;
+        # if required attributes are missing, the type is created without a profile
+        $schema = $script:ProfileSchemas[$ProfileName]
+        $props = $null
+        if ($schema -and $schema.PSObject.Properties['properties']) { $props = $schema.properties }
+        $a = @{}
+        foreach ($k in $Attrs.Keys) {
+            $val = $Attrs[$k]
+            if ($null -eq $val) { continue }
+            if ($props) {
+                if (-not $props.PSObject.Properties[$k]) { continue }
+                $def = $props.$k
+                if ($def.PSObject.Properties['enum'] -and -not (@($def.enum) -contains $val)) { continue }
+            }
+            $a[$k] = $val
+        }
+        $missing = @()
+        if ($schema -and $schema.PSObject.Properties['required']) { $missing = @($schema.required | Where-Object { -not $a.ContainsKey($_) }) }
+        if ($missing.Count -eq 0) { $body.profile = $script:Profiles[$ProfileName]; $body.attributes = $a }
+        else { Warn "module type '$Vendor $Model' is created without profile '$ProfileName': required attributes are unknown ($($missing -join ', '))" }
     }
-    Change "создать тип модуля '$Vendor $Model'"
+    Change "create module type '$Vendor $Model'"
     return [int](Nb POST 'dcim/module-types/' $body).id
 }
 
-# Модуль по серийнику; иначе модуль без серийника в слоте с тем же префиксом; иначе свободный/новый слот
+# Module by serial number; otherwise a module without serial in a bay with the same prefix; otherwise a free/new bay
 function Place-Module([string]$Prefix, [string]$BayName, [string]$Label, [int]$TypeId, [string]$Serial) {
-    if ($script:DeviceId -le 0) { Change "модуль $BayName (устройство ещё не создано)"; return }
+    if ($script:DeviceId -le 0) { Change "module $BayName (device not created yet)"; return }
     $mod = $null
     if ($Serial) { $mod = $script:Modules | Where-Object { $_.serial -eq $Serial } | Select-Object -First 1 }
     if (-not $mod) {
@@ -553,7 +628,7 @@ function Place-Module([string]$Prefix, [string]$BayName, [string]$Label, [int]$T
         if ([int]$mod.module_type.id -ne $TypeId) { $patch.module_type = $TypeId }
         if ($Serial -and $mod.serial -ne $Serial) { $patch.serial = $Serial }
         if ($patch.Count) {
-            Change "обновить модуль в слоте $($mod.module_bay.name): $(ConvertTo-Json -InputObject $patch -Compress)"
+            Change "update module in bay $($mod.module_bay.name): $(ConvertTo-Json -InputObject $patch -Compress)"
             $null = Nb PATCH "dcim/modules/$($mod.id)/" $patch
         }
         $script:Modules = @($script:Modules | Where-Object { $_.id -ne $mod.id })
@@ -565,11 +640,11 @@ function Place-Module([string]$Prefix, [string]$BayName, [string]$Label, [int]$T
         if ($script:Bays | Where-Object { $_.name -eq $BayName }) {
             $n = 1; while ($script:Bays | Where-Object { $_.name -eq "$Prefix$n" }) { $n++ }; $BayName = "$Prefix$n"
         }
-        Change "создать слот $BayName"
+        Change "create bay $BayName"
         $bayId = [int](Nb POST 'dcim/module-bays/' @{ device = $script:DeviceId; name = $BayName; label = $Label; tags = $script:TagRef }).id
         $script:Bays += [pscustomobject]@{ id = $bayId; name = $BayName; installed_module = @{ id = -1 } }
     }
-    Change ("установить модуль в $BayName" + $(if ($Serial) { " (s/n $Serial)" } else { '' }))
+    Change ("install module in $BayName" + $(if ($Serial) { " (s/n $Serial)" } else { '' }))
     $body = @{ device = $script:DeviceId; module_bay = $bayId; module_type = $TypeId; status = 'active'; tags = $script:TagRef }
     if ($Serial) { $body.serial = $Serial }
     $null = Nb POST 'dcim/modules/' $body
@@ -588,7 +663,7 @@ function Sync-Cpu($f) {
 }
 
 function Sync-Memory($f) {
-    if (-not $f.memory.modules -or $f.memory.modules.Count -eq 0) { Log '  модули RAM: нет данных, пропускаю'; return }
+    if (-not $f.memory.modules -or $f.memory.modules.Count -eq 0) { Log '  RAM modules: no data, skipping'; return }
     foreach ($m in $f.memory.modules) {
         $model = if ($m.part) { $m.part } else { "$($m.size_gb)GB $(if ($m.type) { $m.type } else { 'RAM' })" }
         $class = if ($m.type -match '^DDR[345]$') { $m.type } else { $null }
@@ -609,8 +684,20 @@ function Sync-Disks($f) {
     }
 }
 
+function Sync-Gpus($f) {
+    $i = 0
+    foreach ($g in @($f.gpus)) {
+        if ($null -eq $g) { continue }
+        $i++
+        $iface = if ($g.pcie_gen -and $g.pcie_width) { "PCIe $($g.pcie_gen) x$($g.pcie_width)" } else { $null }
+        $chip = (@($g.vendor, $g.name) | Where-Object { $_ }) -join ' '
+        $tid = Ensure-ModuleType $g.card_vendor $g.name 'GPU' @{ gpu = $chip; memory = $g.memory_gb; interface = $iface }
+        Place-Module 'GPU-' "GPU-$i" $g.pci $tid $g.serial
+    }
+}
+
 # ======================================================================
-#  Интерфейсы, MAC, IP
+#  Interfaces, MAC, IP
 # ======================================================================
 $script:IfaceIds = @{}
 
@@ -632,17 +719,17 @@ function Iface-Type($i) {
 }
 
 function Sync-Mac([int]$Iid, [string]$Mac, $Cur, [bool]$NewApi) {
-    if ($Iid -le 0) { Change "MAC $Mac (интерфейс ещё не создан)"; return }
+    if ($Iid -le 0) { Change "MAC $Mac (interface not created yet)"; return }
     if (-not $NewApi) {
         $curMac = if ($Cur) { "$($Cur.mac_address)".ToUpper() } else { '' }
-        if ($curMac -ne $Mac) { Change "MAC $Mac на интерфейс $Iid"; $null = Nb PATCH "dcim/interfaces/$Iid/" @{ mac_address = $Mac } }
+        if ($curMac -ne $Mac) { Change "MAC $Mac on interface $Iid"; $null = Nb PATCH "dcim/interfaces/$Iid/" @{ mac_address = $Mac } }
         return
     }
-    # NetBox 4.2+: MAC — отдельный объект, интерфейс ссылается на primary_mac_address
+    # NetBox 4.2+: a MAC is a separate object, the interface references primary_mac_address
     $o = Nb-Find 'dcim/mac-addresses/' "mac_address=$(Enc $Mac)&interface_id=$Iid"
     if ($o) { $mid = [int]$o.id }
     else {
-        Change "MAC $Mac -> интерфейс $Iid"
+        Change "MAC $Mac -> interface $Iid"
         $mid = [int](Nb POST 'dcim/mac-addresses/' @{ mac_address = $Mac; assigned_object_type = 'dcim.interface'; assigned_object_id = $Iid; tags = $script:TagRef }).id
     }
     $hasPrimary = $Cur -and $Cur.PSObject.Properties['primary_mac_address'] -and $Cur.primary_mac_address
@@ -660,14 +747,14 @@ function Sync-Interfaces($f) {
         if ($cur) {
             $id = [int]$cur.id
             if ($cur.type.value -eq 'other' -and $cur.cable -and $type -in 'bridge', 'lag', 'virtual') {
-                Warn "интерфейс $($i.name): в NetBox к нему подключён кабель, тип '$type' не ставлю"; $type = 'other'
+                Warn "interface $($i.name): a cable is attached in NetBox, not setting type '$type'"; $type = 'other'
             }
             $patch = @{}
             if ($cur.type.value -eq 'other' -and $type -ne 'other') { $patch.type = $type }
             if ($i.mtu -and [int]$cur.mtu -ne [int]$i.mtu) { $patch.mtu = [int]$i.mtu }
-            if ($patch.Count) { Change "обновить интерфейс $($i.name): $(ConvertTo-Json -InputObject $patch -Compress)"; $null = Nb PATCH "dcim/interfaces/$id/" $patch }
+            if ($patch.Count) { Change "update interface $($i.name): $(ConvertTo-Json -InputObject $patch -Compress)"; $null = Nb PATCH "dcim/interfaces/$id/" $patch }
         } else {
-            Change "создать интерфейс $($i.name) ($type)"
+            Change "create interface $($i.name) ($type)"
             $body = @{ device = $script:DeviceId; name = $i.name; type = $type; enabled = [bool]$i.up; description = $i.description; tags = $script:TagRef }
             if ($i.mtu) { $body.mtu = [int]$i.mtu }
             $id = [int](Nb POST 'dcim/interfaces/' $body).id
@@ -692,26 +779,26 @@ function Sync-Ips($f) {
                     if ($ip.assigned_object.PSObject.Properties['device']) { $ownerDev = [int]$ip.assigned_object.device.id; $ownerName = $ip.assigned_object.device.name }
                     elseif ($ip.assigned_object.PSObject.Properties['virtual_machine']) { $ownerDev = -1; $ownerName = $ip.assigned_object.virtual_machine.name }
                 }
-                if ($ownerDev -ne 0 -and $ownerDev -ne $script:DeviceId) { Warn "IP $addr уже назначен другому устройству ($ownerName) — не трогаю"; continue }
+                if ($ownerDev -ne 0 -and $ownerDev -ne $script:DeviceId) { Warn "IP $addr is already assigned to another device ($ownerName) - leaving it"; continue }
                 if ([int]$ip.assigned_object_id -ne $iid) {
                     Change "IP $addr -> $($i.name)"
                     $null = Nb PATCH "ipam/ip-addresses/$ipId/" @{ assigned_object_type = 'dcim.interface'; assigned_object_id = $iid }
                 }
-                if ($isPrimary -and $f.fqdn -and -not $ip.dns_name) { Change "DNS-имя $($f.fqdn) для $addr"; $null = Nb PATCH "ipam/ip-addresses/$ipId/" @{ dns_name = $f.fqdn } }
+                if ($isPrimary -and $f.fqdn -and -not $ip.dns_name) { Change "DNS name $($f.fqdn) for $addr"; $null = Nb PATCH "ipam/ip-addresses/$ipId/" @{ dns_name = $f.fqdn } }
             } else {
                 $body = @{ address = $addr; status = 'active'; assigned_object_type = 'dcim.interface'; assigned_object_id = $iid; tags = $script:TagRef }
                 if ($isPrimary -and $f.fqdn) { $body.dns_name = $f.fqdn }
-                Change "создать IP $addr на $($i.name)"
+                Change "create IP $addr on $($i.name)"
                 $ipId = [int](Nb POST 'ipam/ip-addresses/' $body).id
             }
             if ($isPrimary) { $primary4 = $ipId }
         }
     }
-    # primary_ip4 ставим, только если он не задан (ручной выбор не перезаписываем)
+    # primary_ip4 is set only if it is empty (a manual choice is not overwritten)
     $cur = 0
     if ($script:Device -and $script:Device.primary_ip4) { $cur = [int]$script:Device.primary_ip4.id }
     if ($primary4 -gt 0 -and $script:DeviceId -gt 0 -and $cur -eq 0) {
-        Change "primary IPv4 устройства -> $primary4"
+        Change "device primary IPv4 -> $primary4"
         $null = Nb PATCH "dcim/devices/$($script:DeviceId)/" @{ primary_ip4 = $primary4 }
     }
 }
@@ -719,35 +806,37 @@ function Sync-Ips($f) {
 # ======================================================================
 function Show-Summary($f) {
     $s = $f.system
-    Log ("Хост:      {0}{1}{2}" -f $f.hostname, $(if ($f.fqdn) { " ($($f.fqdn))" } else { '' }), $(if ($f.virtual) { "  [VM: $($f.virt_type)]" } else { '' }))
-    Log ("Система:   {0} {1}  плата: {2} {3}  s/n: {4}" -f $s.vendor, $s.product, $s.board_vendor, $s.board_name, $(if ($s.serial) { $s.serial } elseif ($s.board_serial) { $s.board_serial } else { '-' }))
-    Log ("ОС:        {0}  -> платформа {1}" -f $f.os.pretty, $f.os.platform)
-    Log ("CPU:       {0}x {1}  ({2} ядер/сокет, {3} потоков)" -f $f.cpu.sockets, $f.cpu.model, $f.cpu.cores_per_socket, $f.cpu.threads)
+    Log ("Host:      {0}{1}{2}" -f $f.hostname, $(if ($f.fqdn) { " ($($f.fqdn))" } else { '' }), $(if ($f.virtual) { "  [VM: $($f.virt_type)]" } else { '' }))
+    Log ("System:    {0} {1}  board: {2} {3}  s/n: {4}" -f $s.vendor, $s.product, $s.board_vendor, $s.board_name, $(if ($s.serial) { $s.serial } elseif ($s.board_serial) { $s.board_serial } else { '-' }))
+    Log ("OS:        {0}  -> platform {1}" -f $f.os.pretty, $f.os.platform)
+    Log ("CPU:       {0}x {1}  ({2} cores/socket, {3} threads)" -f $f.cpu.sockets, $f.cpu.model, $f.cpu.cores_per_socket, $f.cpu.threads)
     Log ("RAM:       {0} GB  [{1}]" -f $f.memory.total_gb, ((@($f.memory.modules) | ForEach-Object { "$($_.size_gb)G $($_.vendor) $($_.part)" }) -join ', '))
-    Log ("Диски:     {0}" -f ((@($f.disks) | ForEach-Object { "$($_.name) $($_.size_gb)GB $($_.type) $($_.model)" }) -join '; '))
-    Log ("Сеть:      {0}" -f ((@($f.interfaces) | Where-Object { $_.addresses.Count -gt 0 -and -not (Skip-Interface $_) } | ForEach-Object { "$($_.name) $($_.addresses -join ',')" }) -join '; '))
+    Log ("Disks:     {0}" -f ((@($f.disks) | ForEach-Object { "$($_.name) $($_.size_gb)GB $($_.type) $($_.model)" }) -join '; '))
+    Log ("GPU:       {0}" -f $(if (@($f.gpus).Count) { (@($f.gpus) | ForEach-Object { "$($_.card_vendor) $($_.name)$(if ($_.memory_gb) { " $($_.memory_gb)GB" })" }) -join '; ' } else { '-' }))
+    Log ("Network:   {0}" -f ((@($f.interfaces) | Where-Object { $_.addresses.Count -gt 0 -and -not (Skip-Interface $_) } | ForEach-Object { "$($_.name) $($_.addresses -join ',')" }) -join '; '))
 }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { Warn 'запущено без прав администратора: часть серийных номеров может быть недоступна' }
+if (-not $isAdmin) { Warn 'not running as administrator: some serial numbers may be unavailable' }
 
-Log 'Сбор данных о хосте...'
+Log 'Collecting host data...'
 $facts = Get-Facts
 if ($CollectOnly) { ConvertTo-Json -InputObject $facts -Depth 10; exit 0 }
 Show-Summary $facts
-if ($facts.virtual) { Warn "это виртуальная машина ($($facts.virt_type)): её правильнее вести в Virtualization, а не в Devices" }
-if ($DryRun) { Warn 'режим -DryRun: изменения только выводятся' }
+if ($facts.virtual) { Warn "this is a virtual machine ($($facts.virt_type)): it is better tracked in Virtualization, not Devices" }
+if ($DryRun) { Warn '-DryRun mode: changes are only printed' }
 
 Setup-Api
 Check-NetBox
 Load-Profiles
 Ensure-Device $facts
 Load-DeviceModules
-Log 'Модули...'
+Log 'Modules...'
 Sync-Cpu $facts
 Sync-Memory $facts
 Sync-Disks $facts
-Log 'Интерфейсы и адреса...'
+Sync-Gpus $facts
+Log 'Interfaces and addresses...'
 Sync-Interfaces $facts
 Sync-Ips $facts
-Ok ("Готово: {0}{1}" -f $script:DeviceName, $(if ($DryRun) { ' (dry-run, ничего не изменено)' } else { '' }))
+Ok ("Done: {0}{1}" -f $script:DeviceName, $(if ($DryRun) { ' (dry-run, nothing changed)' } else { '' }))

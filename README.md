@@ -12,7 +12,8 @@
 * можно запускать повторно и по расписанию — если на хосте ничего не изменилось, в NetBox ничего не меняется;
 * `--dry-run` / `-DryRun` показывает, что будет изменено, ничего не записывая;
 * `--collect-only` / `-CollectOnly` выводит собранные данные в JSON (одинаковый формат), NetBox не нужен;
-* железо заносится модулями с [профилями](https://netboxlabs.com/docs/netbox/models/dcim/moduletypeprofile/) `CPU`, `Memory`, `Hard disk` и серийными номерами;
+* железо заносится модулями с [профилями](https://netboxlabs.com/docs/netbox/models/dcim/moduletypeprofile/) `CPU`, `Memory`, `Hard disk`, `GPU` и серийными номерами;
+* сообщения скриптов — на английском;
 * всё созданное помечается тегом `auto-inventory`; сайт, арендатор, стойка и локация только ищутся и никогда не создаются;
 * ничего не удаляют: устаревшие интерфейсы и модули нужно убирать вручную.
 
@@ -44,23 +45,24 @@ Unblock-File .\netbox_inventory.ps1
 * **CPU**: модель, сокеты, ядра, частота, архитектура → модуль `CPU`
 * **RAM**: каждый модуль с производителем, партномером, серийником, типом (DDR3/4/5), частотой, ECC → модули `RAM-N`
 * **Диски**: модель, серийник, размер, тип (HD/SSD/NVME) → модули `Disk-N`. Диски за USB-SATA мостом распознаются через `smartctl`
+* **Видеокарты** (дискретные): производитель карты (по коду вендора платы), модель, объём памяти, интерфейс PCIe → модули `GPU-N`. Встроенная графика CPU (Intel HD/UHD/Iris, AMD Radeon Graphics), BMC (ASPEED, Matrox) и виртуальные адаптеры пропускаются. Объём памяти берётся из `amdgpu` или `nvidia-smi`; если его узнать нельзя (например, NVIDIA с драйвером `nouveau`), тип модуля создаётся без профиля `GPU`, у которого память — обязательный атрибут
 * **Сеть**: физические порты (тип по скорости, включая порты встроенных коммутаторов DSA), Wi-Fi, мосты, bond, VLAN, VPN-туннели (WireGuard, AmneziaWG, OpenVPN), связи порт → мост/bond и VLAN → родитель, MAC-адреса, IPv4/IPv6, DNS-имя и primary IP
 
-Типы модулей создаются с [профилями](https://netboxlabs.com/docs/netbox/models/dcim/moduletypeprofile/) `CPU`, `Memory` и `Hard disk` (NetBox 4.3+). Всё, что создаёт скрипт, помечается тегом `auto-inventory`.
+Типы модулей создаются с [профилями](https://netboxlabs.com/docs/netbox/models/dcim/moduletypeprofile/) `CPU`, `Memory`, `Hard disk` и `GPU` (NetBox 4.3+). Атрибуты сверяются со схемой профиля: значения вне допустимого списка (например, `PCIe 1.0 x16` у старой видеокарты) не отправляются, а если не хватает обязательных атрибутов, тип модуля создаётся без профиля с предупреждением. Всё, что создаёт скрипт, помечается тегом `auto-inventory`.
 
 ### Требования
 
 * `bash` 4+, `curl` 7.55+, `jq`, `iproute2` (с поддержкой `ip -j`), `util-linux` (`lsblk`, `lscpu`)
-* опционально: `dmidecode` (модули RAM и серийники, нужен root), `smartctl` (диски за USB-мостами)
+* опционально: `dmidecode` (модули RAM и серийники, нужен root), `smartctl` (диски за USB-мостами), `lspci` из `pciutils` (видеокарты), `nvidia-smi` (объём памяти и серийник видеокарт NVIDIA)
 * NetBox 4.x и API-токен с правами на чтение и запись
 
 Скрипт ничего не устанавливает сам: если чего-то не хватает, он сообщает об этом и завершается.
 
 ```bash
 # Debian / Ubuntu / Proxmox
-apt install -y curl jq dmidecode smartmontools
+apt install -y curl jq dmidecode smartmontools pciutils
 # RHEL / AlmaLinux / Rocky
-dnf install -y curl jq dmidecode smartmontools
+dnf install -y curl jq dmidecode smartmontools pciutils
 ```
 
 ### Подготовка токена
@@ -160,7 +162,7 @@ echo '30 3 * * * root /root/netbox_inventory.sh --token-file /root/.netbox-token
 
 Для Windows-хостов есть аналог на PowerShell с той же логикой работы с NetBox и тем же форматом `-CollectOnly`. Запускать bash-версию в WSL бессмысленно: WSL2 — это виртуальная машина, и скрипт увидит её виртуальные диски и выделенную ей память, а не железо компьютера.
 
-Данные собираются через CIM/WMI и сетевые командлеты: плата и серийник (`Win32_BaseBoard`, `Win32_BIOS`), CPU (`Win32_Processor`), модули RAM с партномерами и серийниками (`Win32_PhysicalMemory`), диски с серийниками и типом шины (`Get-PhysicalDisk`), сетевые адаптеры, MAC и IP (`Get-NetAdapter`, `Get-NetIPAddress`). Платформа — `Windows` или `Windows Server`.
+Данные собираются через CIM/WMI и сетевые командлеты: плата и серийник (`Win32_BaseBoard`, `Win32_BIOS`), CPU (`Win32_Processor`), модули RAM с партномерами и серийниками (`Win32_PhysicalMemory`), диски с серийниками и типом шины (`Get-PhysicalDisk`), дискретные видеокарты (`Win32_VideoController`), сетевые адаптеры, MAC и IP (`Get-NetAdapter`, `Get-NetIPAddress`). Платформа — `Windows` или `Windows Server`.
 
 ### Требования
 
@@ -209,6 +211,7 @@ Register-ScheduledTask -TaskName 'NetBox inventory' -Action $action -Trigger $tr
 
 ### Особенности Windows-версии
 
+* **Видеокарты**: объём памяти берётся из драйвера (`HardwareInformation.qwMemorySize` в реестре), а не из WMI, где `AdapterRAM` ограничен 4 ГБ. Производитель карты определяется по коду вендора в `SUBSYS` (например, `1458` — Gigabyte, `1043` — ASUS), поколение и ширина PCIe — по свойствам PnP-устройства. Встроенная графика (AMD Radeon(TM) Graphics, Intel UHD/Iris), Microsoft Basic Display и адаптеры удалённого доступа пропускаются.
 * **Модель устройства** берётся из `Win32_ComputerSystem`, а если там заглушка (`System Product Name` на самосборных ПК) — из модели материнской платы.
 * **Сетевые адаптеры**: учитываются физические Ethernet и Wi-Fi (тип по скорости линка и поколению Wi-Fi: 802.11ac/ax/be), а также VPN-адаптеры с IP-адресами. Пропускаются Bluetooth, Wi-Fi Direct и виртуальные «двойники» Wi-Fi 7 (HBS/MLO), внутренние сети Hyper-V и WSL (`vEthernet (WSL)`, `vEthernet (Default Switch)`), адаптеры VirtualBox/VMware Host-Only, туннели Teredo/ISATAP/6to4 и виртуальные адаптеры без адресов. Временные IPv6-адреса (privacy extensions) не добавляются.
 * **Имена интерфейсов** — как в Windows (`Ethernet`, `Wi-Fi`), в описание интерфейса пишется модель адаптера.

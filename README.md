@@ -6,6 +6,7 @@
 |---|---|---|
 | [`netbox_inventory.sh`](netbox_inventory.sh) | Linux (Debian, Ubuntu, RHEL/AlmaLinux, Proxmox VE, TrueNAS SCALE, UniFi OS и др.) | `bash` 4+, `curl`, `jq`, `iproute2`, `util-linux` |
 | [`netbox_inventory.ps1`](netbox_inventory.ps1) | Windows 10/11, Windows Server 2016+ | Windows PowerShell 5.1 или PowerShell 7+, больше ничего |
+| [`netbox_proxmox_vms.sh`](netbox_proxmox_vms.sh) | узел Proxmox VE: виртуальные машины всего кластера → раздел *Virtualization* | `bash` 4+, `curl`, `jq`, `pvesh` |
 
 Оба скрипта устроены одинаково:
 
@@ -155,7 +156,64 @@ echo '30 3 * * * root /root/netbox_inventory.sh --token-file /root/.netbox-token
 * **Ничего не удаляет**: интерфейсы и модули, которых больше нет на хосте, нужно убирать вручную.
 * Если платформа в NetBox ограничена производителем (поле *Manufacturer* у платформы), а устройство другого производителя, платформа не назначается, и выводится предупреждение.
 
-Виртуальные машины скрипт добавляет как устройства и выводит предупреждение: в NetBox их правильнее вести в разделе *Virtualization*.
+Виртуальные машины скрипт добавляет как устройства и выводит предупреждение: в NetBox их правильнее вести в разделе *Virtualization* — для ВМ Proxmox это делает [`netbox_proxmox_vms.sh`](#proxmox-ve-netbox_proxmox_vmssh).
+
+
+## Proxmox VE: `netbox_proxmox_vms.sh`
+
+Заносит виртуальные машины Proxmox VE в раздел *Virtualization*. Запускается от root на любом узле кластера Proxmox и обрабатывает ВМ всех узлов (`pvesh get /cluster/resources`). Контейнеры LXC и шаблоны ВМ пропускаются (шаблоны — пока не задан `--include-templates`).
+
+### Что собирается
+
+* **ВМ**: имя, узел Proxmox, статус (`running` → active, остальное → offline), vCPU (`sockets × cores` или `vcpus`), память, VMID → поле *Serial number*
+* **Диски** `scsiN`/`virtioN`/`sataN`/`ideN` с размером (CD-ROM пропускаются) → *Virtual disks*
+* **Сеть**: каждый `netN` из конфигурации ВМ с MAC-адресом. Если в ВМ работает QEMU guest agent, интерфейс сопоставляется с интерфейсом гостя по MAC: берётся его имя (`eth0` вместо `net0`) и IP-адреса (без loopback и link-local). Интерфейсы гостя, которых нет в конфигурации Proxmox (мосты, bond, CNI Kubernetes), не заносятся. DNS-имя адреса — по PTR (`getent hosts`)
+
+`--collect-only` выводит собранное в JSON, NetBox не нужен.
+
+### Что скрипт делает и чего не делает
+
+* **Кластер NetBox обязателен** (`--cluster`) и только ищется, как и арендатор (`--tenant`).
+* **ВМ ставится на устройство узла**: устройство NetBox с именем узла Proxmox (`lab01`). NetBox требует, чтобы это устройство было в том же кластере; если нет — ВМ заводится без устройства и выводится предупреждение. Устройства скрипт не меняет.
+* **Роль и платформа** задаются только новым ВМ — правилами по имени, первое совпавшее: `--role '^talos-cp=k8s control plane'`, `--platform '^talos-=Talos Linux'`. Отсутствующие роли (с признаком *VM role*) и платформы создаются.
+* **У существующих ВМ обновляет** только то, что знает Proxmox: статус, vCPU, память, узел (после миграции) и VMID, если поле пустое. Роль, платформа, арендатор, описание и комментарии остаются как в NetBox.
+* **Диски, интерфейсы, MAC и IP** создаются, размер диска обновляется. `primary_ip4` — первый IPv4 первого интерфейса, ставится только если пуст. Чужие IP не забираются.
+* **Ничего не удаляет**: удалённые ВМ, диски и интерфейсы нужно убирать вручную. Всё созданное помечается тегом `auto-inventory`.
+* Требуется NetBox 4.2+ (MAC-адреса — отдельные объекты, размеры ВМ в МБ).
+
+### Использование
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/svoronkin/netbox-inventory/main/netbox_proxmox_vms.sh
+chmod +x netbox_proxmox_vms.sh
+
+# 1. Что собрано (NetBox не нужен)
+./netbox_proxmox_vms.sh --collect-only
+
+# 2. Пробный прогон
+./netbox_proxmox_vms.sh --token-file /root/.netbox-token --cluster Lab --tenant LAB --dry-run
+
+# 3. Применить, с ролями и платформой для новых ВМ кластера Talos
+./netbox_proxmox_vms.sh --token-file /root/.netbox-token --cluster Lab --tenant LAB --filter '^talos-' \
+    --role '^talos-cp=k8s control plane' --role '^talos-wrk-=k8s worker' --platform '^talos-=Talos Linux'
+```
+
+Регулярный запуск — на одном узле кластера, по cron (как у `netbox_inventory.sh`).
+
+### Параметры
+
+| Параметр | Переменная окружения | Описание |
+|---|---|---|
+| `-u`, `--url`, `--token-file`, `--cacert`, `--resolve`, `--insecure` | как у `netbox_inventory.sh` | подключение к NetBox |
+| `-c`, `--cluster NAME` | `CLUSTER_NAME` | кластер NetBox (обязателен) |
+| `--tenant TENANT` | `TENANT_NAME` | арендатор новых ВМ и их IP-адресов |
+| `-f`, `--filter REGEX` | `VM_FILTER` | только ВМ, имя которых подходит под регулярное выражение |
+| `--role 'REGEX=ROLE'` | | роль новой ВМ по имени (можно несколько) |
+| `--platform 'REGEX=NAME'` | | платформа новой ВМ по имени (можно несколько) |
+| `--include-templates` | | заносить и шаблоны ВМ |
+| `--dry-run`, `--collect-only`, `--no-ipv6`, `--debug` | | как у `netbox_inventory.sh` |
+| `--no-dns` | | не искать DNS-имена адресов |
+| | `NETBOX_TAG` | тег созданных объектов (по умолчанию `auto-inventory`) |
 
 
 ## Windows: `netbox_inventory.ps1`

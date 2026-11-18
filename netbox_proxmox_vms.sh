@@ -7,7 +7,7 @@
 set -euo pipefail
 export LC_ALL=C
 
-SCRIPT_VERSION=1.0.0
+SCRIPT_VERSION=1.1.0
 
 # ---------- settings (env or arguments) ----------
 NETBOX_URL=${NETBOX_URL:-https://netbox.p4el.net}
@@ -308,6 +308,14 @@ check_netbox() {
         nb_ensure_named "extras/tags/" "$NETBOX_TAG" '{"color":"9e9e9e","description":"Created by netbox-inventory scripts"}' >/dev/null
     fi
     TAG_JSON=$(jq -cn --arg s "$(slugify "$NETBOX_TAG")" '[{slug:$s}]')
+    # Optional custom field `vmid` (integer, virtual machines): filled when it exists, never created
+    local cf
+    cf=$(nb_find "extras/custom-fields/" "name=vmid") || die "cannot read custom fields from NetBox"
+    if [[ -n $cf ]] && jq -e '.object_types | index("virtualization.virtualmachine")' <<<"$cf" >/dev/null; then
+        VMID_CF=1
+    else
+        warn "no custom field 'vmid' for virtual machines in NetBox - the VMID goes to Serial number only"
+    fi
 }
 
 # ======================================================================
@@ -315,6 +323,7 @@ check_netbox() {
 # ======================================================================
 CLUSTER_ID=""
 TENANT_ID=""
+VMID_CF=0                   # 1 = NetBox has the custom field `vmid` on virtual machines
 declare -A NODE_DEVICE=()   # Proxmox node -> NetBox device id in the cluster (or empty)
 
 node_device() {
@@ -349,8 +358,9 @@ sync_vm() {
         if [[ -n $role ]]; then role_id=$(nb_ensure_named "dcim/device-roles/" "$role" '{"color":"9e9e9e","vm_role":true}') || return 1; fi
         if [[ -n $platform ]]; then platform_id=$(nb_ensure_named "dcim/platforms/" "$platform") || return 1; fi
         body=$(jq -cn --argjson v "$vm" --arg st "$nbstatus" --argjson c "$CLUSTER_ID" --arg d "$dev_id" --arg t "$TENANT_ID" \
-            --arg r "$role_id" --arg p "$platform_id" --argjson tags "$TAG_JSON" '
+            --arg r "$role_id" --arg p "$platform_id" --argjson tags "$TAG_JSON" --arg cf "$VMID_CF" '
             {name:$v.name, cluster:$c, status:$st, vcpus:$v.vcpus, memory:$v.memory_mb, serial:($v.vmid|tostring), tags:$tags}
+            + (if $cf == "1" then {custom_fields:{vmid:$v.vmid}} else {} end)
             + (if $d != "" then {device:($d|tonumber)} else {} end)
             + (if $t != "" then {tenant:($t|tonumber)} else {} end)
             + (if $r != "" and $r != "0" then {role:($r|tonumber)} else {} end)
@@ -360,14 +370,16 @@ sync_vm() {
         cur='{}'
     else
         vm_id=$(jq -r .id <<<"$cur")
-        # What Proxmox knows is synced: status, vCPU, memory, node (after migration), VMID if empty.
+        # What Proxmox knows is synced: status, vCPU, memory, node (after migration), VMID into Serial if empty
+        # and into the custom field `vmid` (when NetBox has it) whenever it differs.
         # Role, platform, tenant, description and comments are left as they are in NetBox.
-        patch=$(jq -cn --argjson c "$cur" --argjson v "$vm" --arg st "$nbstatus" --arg d "$dev_id" '
+        patch=$(jq -cn --argjson c "$cur" --argjson v "$vm" --arg st "$nbstatus" --arg d "$dev_id" --arg cf "$VMID_CF" '
             {}
             + (if ($c.status.value // "") != $st then {status:$st} else {} end)
             + (if (($c.vcpus // 0)|tonumber) != $v.vcpus then {vcpus:$v.vcpus} else {} end)
             + (if ($c.memory // 0) != $v.memory_mb then {memory:$v.memory_mb} else {} end)
             + (if ($c.serial // "") == "" then {serial:($v.vmid|tostring)} else {} end)
+            + (if $cf == "1" and ($c.custom_fields.vmid // null) != $v.vmid then {custom_fields:{vmid:$v.vmid}} else {} end)
             + (if $d != "" and (($c.device.id // 0)|tostring) != $d then {device:($d|tonumber)} else {} end)')
         if [[ $patch != '{}' ]]; then
             change "update VM '$name': $patch"
